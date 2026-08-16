@@ -8,7 +8,6 @@
 
 #define DRM_DRIVER_NAME "fl2000_drm"
 #define DRM_DRIVER_DESC "USB-HDMI"
-#define DRM_DRIVER_DATE "20181001"
 
 #define DRM_DRIVER_MAJOR      0
 #define DRM_DRIVER_MINOR      0
@@ -19,7 +18,6 @@
 #define FL20000_MAX_HEIGHT 4000
 
 /* Force using 32-bit XRGB8888 on input for simplicity */
-#define FL2000_FB_BPP 32
 static const u32 fl2000_pixel_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
@@ -104,16 +102,15 @@ static void fl2000_drm_release(struct drm_device *drm)
 
 static struct drm_driver fl2000_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
-	.lastclose = drm_fb_helper_lastclose,
 	.ioctls = NULL,
 	.fops = &fl2000_drm_driver_fops,
 	.release = fl2000_drm_release,
 
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
+	DRM_FBDEV_DMA_DRIVER_OPS,
 
 	.name = DRM_DRIVER_NAME,
 	.desc = DRM_DRIVER_DESC,
-	.date = DRM_DRIVER_DATE,
 	.major = DRM_DRIVER_MAJOR,
 	.minor = DRM_DRIVER_MINOR,
 	.patchlevel = DRM_DRIVER_PATCHLEVEL,
@@ -524,7 +521,7 @@ int fl2000_drm_bind(struct device *master)
 	fl2000_reset(usb_dev);
 	fl2000_usb_magic(usb_dev);
 
-	drm_fbdev_generic_setup(drm, FL2000_FB_BPP);
+	drm_client_setup_with_fourcc(drm, fl2000_pixel_formats[0]);
 
 	return 0;
 }
