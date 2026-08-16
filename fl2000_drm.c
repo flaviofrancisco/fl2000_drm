@@ -22,6 +22,16 @@ static const u32 fl2000_pixel_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
 
+/* Software-composited cursor plane: alpha-blended into the transmitted frame ourselves, since
+ * there is no hardware cursor and userspace's own software-cursor fallback does not reliably
+ * reach this display-only, renderless USB adapter
+ */
+static const u32 fl2000_cursor_formats[] = {
+	DRM_FORMAT_ARGB8888,
+};
+
+#define FL2000_CURSOR_MAX_SIZE 64
+
 /* Maximum pixel clock set to 500MHz. It is hard to get more or less precise PLL configuration for
  * higher clock
  */
@@ -88,8 +98,21 @@ struct fl2000_drm_if {
 	struct usb_device *usb_dev;
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;
+	struct drm_plane cursor_plane;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
+
+	/* Compositing: 'fb_cache' is a pristine copy of the latest primary framebuffer content,
+	 * 'compose_buf' is 'fb_cache' with the cursor plane blended on top, sent to the streaming
+	 * interface. Keeping the two separate avoids the cursor leaving trails when it moves
+	 * without the primary content changing
+	 */
+	struct mutex compose_lock;
+	void *fb_cache;
+	void *compose_buf;
+	size_t fb_buf_size;
+	unsigned int fb_width;
+	unsigned int fb_height;
 };
 
 DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
@@ -291,6 +314,135 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	drm_crtc_vblank_off(crtc);
 }
 
+/* (Re)allocate the compositing buffers to match a new mode's dimensions. No-op if the size is
+ * unchanged (e.g. same mode reconfigured)
+ */
+static int fl2000_realloc_compose_buffers(struct fl2000_drm_if *drm_if, unsigned int width,
+					  unsigned int height)
+{
+	size_t size = (size_t)width * height * sizeof(u32);
+	void *fb_cache;
+	void *compose_buf;
+
+	if (drm_if->fb_buf_size == size)
+		return 0;
+
+	fb_cache = vzalloc(size);
+	compose_buf = vzalloc(size);
+	if (!fb_cache || !compose_buf) {
+		vfree(fb_cache);
+		vfree(compose_buf);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&drm_if->compose_lock);
+	vfree(drm_if->fb_cache);
+	vfree(drm_if->compose_buf);
+	drm_if->fb_cache = fb_cache;
+	drm_if->compose_buf = compose_buf;
+	drm_if->fb_buf_size = size;
+	drm_if->fb_width = width;
+	drm_if->fb_height = height;
+	mutex_unlock(&drm_if->compose_lock);
+
+	return 0;
+}
+
+/* Alpha-blend an ARGB8888 cursor image onto an XRGB8888 destination buffer, clipped to the
+ * destination bounds. Straight (non-premultiplied) alpha, standard 'over' compositing
+ */
+static void fl2000_blend_cursor(void *dst_buf, unsigned int dst_width, unsigned int dst_height,
+				void *cursor_buf, unsigned int cursor_pitch, int cursor_x,
+				int cursor_y, unsigned int cursor_width, unsigned int cursor_height)
+{
+	u8 *cursor_bytes = cursor_buf;
+	u8 *dst_bytes = dst_buf;
+
+	for (unsigned int cy = 0; cy < cursor_height; cy++) {
+		int dy = cursor_y + (int)cy;
+		u32 *src_row;
+		u32 *dst_row;
+
+		if (dy < 0 || dy >= (int)dst_height)
+			continue;
+
+		src_row = (u32 *)(cursor_bytes + cy * cursor_pitch);
+		dst_row = (u32 *)(dst_bytes + (unsigned int)dy * dst_width * sizeof(u32));
+
+		for (unsigned int cx = 0; cx < cursor_width; cx++) {
+			int dx = cursor_x + (int)cx;
+			u32 src_px, alpha, inv_alpha;
+			u8 sr, sg, sb, dr, dg, db;
+
+			if (dx < 0 || dx >= (int)dst_width)
+				continue;
+
+			src_px = src_row[cx];
+			alpha = src_px >> 24;
+			if (alpha == 0)
+				continue;
+
+			if (alpha == 0xFF) {
+				dst_row[dx] = src_px & 0x00FFFFFF;
+				continue;
+			}
+
+			inv_alpha = 0xFF - alpha;
+			sr = (src_px >> 16) & 0xFF;
+			sg = (src_px >> 8) & 0xFF;
+			sb = src_px & 0xFF;
+			dr = (dst_row[dx] >> 16) & 0xFF;
+			dg = (dst_row[dx] >> 8) & 0xFF;
+			db = dst_row[dx] & 0xFF;
+
+			dr = (u8)((sr * alpha + dr * inv_alpha) / 0xFF);
+			dg = (u8)((sg * alpha + dg * inv_alpha) / 0xFF);
+			db = (u8)((sb * alpha + db * inv_alpha) / 0xFF);
+
+			dst_row[dx] = ((u32)dr << 16) | ((u32)dg << 8) | db;
+		}
+	}
+}
+
+/* Composite the cached primary content with the current cursor plane state (if any) and send
+ * the result out over the streaming interface. Called whenever either plane changes
+ */
+static void fl2000_compose_and_send(struct fl2000_drm_if *drm_if)
+{
+	int idx;
+	struct drm_plane_state *cstate;
+
+	if (!drm_if->fb_cache || !drm_if->compose_buf)
+		return;
+
+	if (!drm_dev_enter(&drm_if->drm, &idx))
+		return;
+
+	mutex_lock(&drm_if->compose_lock);
+
+	memcpy(drm_if->compose_buf, drm_if->fb_cache, drm_if->fb_buf_size);
+
+	cstate = drm_if->cursor_plane.state;
+	if (cstate && cstate->fb && cstate->crtc) {
+		struct drm_gem_dma_object *cursor_obj = drm_fb_dma_get_gem_obj(cstate->fb, 0);
+
+		if (!drm_gem_fb_begin_cpu_access(cstate->fb, DMA_FROM_DEVICE)) {
+			fl2000_blend_cursor(drm_if->compose_buf, drm_if->fb_width,
+					    drm_if->fb_height, cursor_obj->vaddr,
+					    cstate->fb->pitches[0], cstate->crtc_x,
+					    cstate->crtc_y, cstate->crtc_w, cstate->crtc_h);
+			drm_gem_fb_end_cpu_access(cstate->fb, DMA_FROM_DEVICE);
+		}
+	}
+
+	fl2000_stream_compress(drm_if->stream, drm_if->compose_buf, drm_if->fb_height,
+			       drm_if->fb_width, drm_if->fb_width * sizeof(u32));
+
+	mutex_unlock(&drm_if->compose_lock);
+
+	drm_dev_exit(idx);
+}
+
 static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 {
 	int ret;
@@ -301,21 +453,31 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 
 	UNUSED(rect);
 
+	if (!drm_if->fb_cache)
+		return;
+
 	if (!drm_dev_enter(fb->dev, &idx)) {
 		dev_err(drm->dev, "DRM enter failed!");
 		return;
 	}
 
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (ret)
+	if (ret) {
+		drm_dev_exit(idx);
 		return;
+	}
 
-	fl2000_stream_compress(drm_if->stream, dma_obj->vaddr, fb->height, fb->width,
-			       fb->pitches[0]);
+	mutex_lock(&drm_if->compose_lock);
+	for (unsigned int y = 0; y < fb->height; y++)
+		memcpy(drm_if->fb_cache + y * fb->width * sizeof(u32),
+		       dma_obj->vaddr + y * fb->pitches[0], fb->width * sizeof(u32));
+	mutex_unlock(&drm_if->compose_lock);
 
 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 
 	drm_dev_exit(idx);
+
+	fl2000_compose_and_send(drm_if);
 }
 
 static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
@@ -350,6 +512,53 @@ static const struct drm_simple_display_pipe_funcs fl2000_display_funcs = {
 	.update = fl2000_display_update
 };
 
+static int fl2000_cursor_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_state;
+
+	if (!new_plane_state->crtc)
+		return 0;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, new_plane_state->crtc);
+
+	return drm_atomic_helper_check_plane_state(new_plane_state, crtc_state, DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING, true, true);
+}
+
+static void fl2000_cursor_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct fl2000_drm_if *drm_if = plane->dev->dev_private;
+
+	UNUSED(state);
+
+	fl2000_compose_and_send(drm_if);
+}
+
+static void fl2000_cursor_plane_atomic_disable(struct drm_plane *plane, struct drm_atomic_state *state)
+{
+	struct fl2000_drm_if *drm_if = plane->dev->dev_private;
+
+	UNUSED(state);
+
+	fl2000_compose_and_send(drm_if);
+}
+
+static const struct drm_plane_funcs fl2000_cursor_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
+
+static const struct drm_plane_helper_funcs fl2000_cursor_plane_helper_funcs = {
+	.atomic_check = fl2000_cursor_plane_atomic_check,
+	.atomic_update = fl2000_cursor_plane_atomic_update,
+	.atomic_disable = fl2000_cursor_plane_atomic_disable,
+};
+
 static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_display_mode *mode,
 				   struct drm_display_mode *adjusted_mode)
 {
@@ -368,6 +577,12 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	bytes_pix = fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode->clock);
 	if (!bytes_pix)
 		return;
+
+	if (fl2000_realloc_compose_buffers(drm_if, adjusted_mode->hdisplay,
+					   adjusted_mode->vdisplay)) {
+		dev_err(drm->dev, "Cannot allocate composition buffers");
+		return;
+	}
 
 	dev_info(drm->dev, "Mode requested:  " DRM_MODE_FMT, DRM_MODE_ARG(mode));
 	dev_info(drm->dev, "Mode configured: " DRM_MODE_FMT, DRM_MODE_ARG(adjusted_mode));
@@ -430,6 +645,10 @@ static void fl2000_drm_if_release(struct device *dev, void *res)
 	/* Prepare to DRM device shutdown */
 	drm_kms_helper_poll_fini(drm);
 	drm_dev_unplug(drm);
+
+	vfree(drm_if->fb_cache);
+	vfree(drm_if->compose_buf);
+
 	drm_dev_put(drm);
 }
 
@@ -453,6 +672,7 @@ int fl2000_drm_bind(struct device *master)
 	drm = &drm_if->drm;
 	drm_if->usb_dev = usb_dev;
 	drm->dev_private = drm_if;
+	mutex_init(&drm_if->compose_lock);
 
 	ret = drmm_mode_config_init(drm);
 	if (ret) {
@@ -485,6 +705,19 @@ int fl2000_drm_bind(struct device *master)
 
 	/* Register 'mode_set' function to operate prior to bridge */
 	drm_encoder_helper_add(&drm_if->pipe.encoder, &fl2000_encoder_funcs);
+
+	ret = drm_universal_plane_init(drm, &drm_if->cursor_plane,
+				       drm_crtc_mask(&drm_if->pipe.crtc), &fl2000_cursor_plane_funcs,
+				       fl2000_cursor_formats, ARRAY_SIZE(fl2000_cursor_formats),
+				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret) {
+		dev_err(drm->dev, "Cannot configure cursor plane (%d)", ret);
+		return ret;
+	}
+	drm_plane_helper_add(&drm_if->cursor_plane, &fl2000_cursor_plane_helper_funcs);
+
+	mode_config->cursor_width = FL2000_CURSOR_MAX_SIZE;
+	mode_config->cursor_height = FL2000_CURSOR_MAX_SIZE;
 
 	/* Start streaming interface */
 	drm_if->stream = fl2000_stream_create(usb_dev, &drm_if->pipe.crtc);

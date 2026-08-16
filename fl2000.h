@@ -22,6 +22,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/time.h>
 #include <linux/device.h>
+#include <linux/mutex.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vblank.h>
@@ -34,6 +35,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_fbdev_dma.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_crtc_helper.h>
@@ -100,6 +102,9 @@ static inline int fl2000_urb_status(struct usb_device *usb_dev, int status, int 
 	int ret = status;
 
 	switch (status) {
+	case 0:
+		/* Success */
+		break;
 	/* Stalled endpoint */
 	case -EPIPE:
 		ret = usb_clear_halt(usb_dev, pipe);

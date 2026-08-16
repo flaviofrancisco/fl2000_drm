@@ -158,7 +158,7 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	if (stream) {
 		spin_lock_irq(&stream->list_lock);
 		list_move_tail(&cur_sb->list, &stream->render_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irq(&stream->list_lock);
 
 		drm_crtc_handle_vblank(stream->crtc);
 
@@ -209,7 +209,7 @@ static void fl2000_stream_work(struct work_struct *work)
 						  list);
 		}
 		list_move_tail(&cur_sb->list, &stream->wait_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irq(&stream->list_lock);
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!data_urb) {
@@ -265,9 +265,15 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	void *dst;
 	u32 dst_line_len;
 
-	BUG_ON(list_empty(&stream->render_list));
-
 	spin_lock_irq(&stream->list_lock);
+
+	/* All buffers are still in flight over USB (e.g. cursor-plane updates can arrive faster
+	 * than transfers complete) - drop this frame instead of blocking or crashing
+	 */
+	if (list_empty(&stream->render_list)) {
+		spin_unlock_irq(&stream->list_lock);
+		return;
+	}
 
 	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
 	dst = cur_sb->vaddr;
@@ -289,7 +295,7 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	}
 
 	list_move_tail(&cur_sb->list, &stream->transmit_list);
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irq(&stream->list_lock);
 }
 
 int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_pix)
@@ -358,7 +364,7 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		cur_sb = list_first_entry(&stream->wait_list, struct fl2000_stream_buf, list);
 		list_move_tail(&cur_sb->list, &stream->render_list);
 	}
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irq(&stream->list_lock);
 }
 
 /**
