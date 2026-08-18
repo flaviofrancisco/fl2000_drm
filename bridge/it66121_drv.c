@@ -45,12 +45,9 @@ struct it66121_priv {
 };
 
 /* XXX: Only one instance of IT66121 is supported!!!
- *  - need to have a way to configure several I2C buses to scan
  *  - need to have a list of objects for registration / deregistration
  */
 static struct it66121_priv *ctx;
-static int i2c_bus_num;
-module_param(i2c_bus_num, int, 0660);
 
 static const struct regmap_range_cfg it66121_regmap_banks[] = {
 	/* Do not put common registers to any range, this will lead to skipping "bank" configuration
@@ -596,6 +593,15 @@ static int it66121_bridge_attach(struct drm_bridge *bridge, struct drm_encoder *
 		return ret;
 	}
 
+	/* The chip only raises an HPD interrupt on a plug/unplug edge, so if a monitor is
+	 * already connected when this driver loads (e.g. module reload during bring-up),
+	 * no edge ever fires and drm_helper_hpd_irq_event() is never called. Without these
+	 * poll flags, drm_kms_helper's periodic poll worker (started by fl2000_drm.c) skips
+	 * this connector entirely, so a compositor that already opened the device before our
+	 * first detect() ran would never be notified that the monitor is actually connected.
+	 */
+	priv->connector.polled = DRM_CONNECTOR_POLL_CONNECT | DRM_CONNECTOR_POLL_DISCONNECT;
+
 	drm_connector_register(&priv->connector);
 
 	/* Start interrupts */
@@ -852,16 +858,37 @@ static int it66121_i2c_probe(struct i2c_adapter *adapter, unsigned short address
 	return 0;
 }
 
+static int it66121_match_adapter_name(struct device *dev, const void *data)
+{
+	struct i2c_adapter *adapter = i2c_verify_adapter(dev);
+
+	return adapter && !strcmp(adapter->name, (const char *)data);
+}
+
 static struct i2c_client *it66121_i2c_init(void)
 {
 	struct i2c_client *client;
 	struct i2c_board_info board_info = { I2C_BOARD_INFO("it66121", 0) };
 	struct i2c_adapter *adapter;
+	struct device *bridge_dev;
 
 	/* According to datasheet IT66121 addresses are 0x98 or 0x9A including cmd */
 	const unsigned short it66121_addr[] = { (0x98 >> 1), (0x9A >> 1), I2C_CLIENT_END };
 
-	adapter = i2c_get_adapter(i2c_bus_num);
+	/* The FL2000 bridge's own virtual I2C adapter gets a dynamically assigned bus number
+	 * that varies across boots depending on what other I2C adapters are already registered
+	 * (e.g. this laptop's onboard GPU exposes its own GMBUS I2C buses, which can carry an
+	 * unrelated, identically-addressed IT66121-family chip driving the built-in HDMI port).
+	 * Scanning a hardcoded/guessed bus number risks silently binding to that wrong chip
+	 * instead, so find our adapter by the unique name fl2000_i2c_init() gives it
+	 */
+	bridge_dev = bus_find_device(&i2c_bus_type, NULL, "FL2000 bridge I2C bus",
+				     it66121_match_adapter_name);
+	if (!bridge_dev)
+		return ERR_PTR(-ENODEV);
+
+	adapter = i2c_get_adapter(i2c_verify_adapter(bridge_dev)->nr);
+	put_device(bridge_dev);
 	if (!adapter)
 		return ERR_PTR(-ENODEV);
 

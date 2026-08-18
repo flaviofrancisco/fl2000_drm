@@ -687,9 +687,15 @@ int fl2000_drm_bind(struct device *master)
 	mode_config->min_height = 1;
 	mode_config->max_height = FL20000_MAX_HEIGHT;
 
-	/* Set DMA mask for DRM device from mask of the 'parent' USB device */
+	/* DRM device sits on the i2c 'master' rather than the USB device itself, so it has no
+	 * streaming DMA mask of its own. Point it at its own coherent mask storage and derive
+	 * both masks from the 'parent' USB device, otherwise PRIME dma-buf imports (used by
+	 * compositors to scan out GPU-rendered frames on this display-only adapter) fail their
+	 * DMA mapping validity check
+	 */
+	drm->dev->dma_mask = &drm->dev->coherent_dma_mask;
 	dma_mask = dma_get_mask(&usb_dev->dev);
-	ret = dma_set_coherent_mask(drm->dev, dma_mask);
+	ret = dma_set_mask_and_coherent(drm->dev, dma_mask);
 	if (ret) {
 		dev_err(drm->dev, "Cannot set DRM device DMA mask (%d)", ret);
 		return ret;
@@ -753,6 +759,14 @@ int fl2000_drm_bind(struct device *master)
 
 	fl2000_reset(usb_dev);
 	fl2000_usb_magic(usb_dev);
+
+	/* The bridge's HPD signalling (both the USB interrupt endpoint and the IT66121's own
+	 * interrupt status bit) is edge-triggered: it only fires on a plug/unplug transition. If
+	 * the monitor is already connected when this driver loads, no edge ever occurs, so a
+	 * compositor that opened the device at registration time is never told to probe the
+	 * connector. Fire one hotplug event unconditionally here to force that initial probe.
+	 */
+	drm_kms_helper_hotplug_event(drm);
 
 	drm_client_setup_with_fourcc(drm, fl2000_pixel_formats[0]);
 
