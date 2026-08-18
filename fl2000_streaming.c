@@ -192,7 +192,11 @@ static void fl2000_stream_work(struct work_struct *work)
 		spin_lock_irq(&stream->list_lock);
 
 		/* If no buffers are available for immediate transmission - then copy latest
-		 * transmission data
+		 * transmission data. Take exclusive ownership of the destination buffer and drop
+		 * the lock before the memcpy (a full frame, several MB): this runs on essentially
+		 * every streaming iteration whenever there is no fresh frame queued, so holding
+		 * interrupts off for its whole duration starves USB completion handling and
+		 * underruns the device's video FIFO - same rationale as fl2000_stream_compress()
 		 */
 		if (list_empty(&stream->transmit_list)) {
 			if (list_empty(&stream->wait_list))
@@ -203,12 +207,18 @@ static void fl2000_stream_work(struct work_struct *work)
 							  struct fl2000_stream_buf, list);
 			cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf,
 						  list);
+			list_del(&cur_sb->list);
+			spin_unlock_irq(&stream->list_lock);
+
 			memcpy(cur_sb->vaddr, last_sb->vaddr, stream->buf_size);
+
+			spin_lock_irq(&stream->list_lock);
 		} else {
 			cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
 						  list);
+			list_del(&cur_sb->list);
 		}
-		list_move_tail(&cur_sb->list, &stream->wait_list);
+		list_add_tail(&cur_sb->list, &stream->wait_list);
 		spin_unlock_irq(&stream->list_lock);
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -267,15 +277,34 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 
 	spin_lock_irq(&stream->list_lock);
 
-	/* All buffers are still in flight over USB (e.g. cursor-plane updates can arrive faster
-	 * than transfers complete) - drop this frame instead of blocking or crashing
-	 */
-	if (list_empty(&stream->render_list)) {
+	if (!list_empty(&stream->render_list)) {
+		cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	} else if (!list_empty(&stream->transmit_list)) {
+		/* No free buffer, but a previous update is still queued behind us, not yet
+		 * picked up by fl2000_stream_work(): overwrite it with this newer frame instead
+		 * of dropping the update. Otherwise, under fast-changing content (scrolling,
+		 * video) where compress calls outrun USB throughput, several stale frames queue
+		 * up and get sent out one by one after the content has already moved on, which
+		 * is seen on screen as trembling/judder in exactly the regions that are updating
+		 */
+		cur_sb = list_last_entry(&stream->transmit_list, struct fl2000_stream_buf, list);
+	} else {
+		/* All buffers are in flight over USB - drop this frame instead of blocking or
+		 * crashing
+		 */
 		spin_unlock_irq(&stream->list_lock);
 		return;
 	}
 
-	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	/* Take exclusive ownership of the buffer now, so the pixel-format conversion below can
+	 * run with interrupts enabled: cursor-plane moves can call this back-to-back on every
+	 * mouse-move event, and stalling USB completion interrupts for the whole conversion loop
+	 * starves fl2000_stream_work() of buffers to submit, which underruns the device's video
+	 * FIFO and shows up on screen as stale/duplicated frame content
+	 */
+	list_del(&cur_sb->list);
+	spin_unlock_irq(&stream->list_lock);
+
 	dst = cur_sb->vaddr;
 	dst_line_len = width * stream->bytes_pix;
 
@@ -294,7 +323,8 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 		dst += dst_line_len;
 	}
 
-	list_move_tail(&cur_sb->list, &stream->transmit_list);
+	spin_lock_irq(&stream->list_lock);
+	list_add_tail(&cur_sb->list, &stream->transmit_list);
 	spin_unlock_irq(&stream->list_lock);
 }
 
